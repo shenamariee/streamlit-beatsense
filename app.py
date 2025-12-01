@@ -124,7 +124,7 @@ tachy_label_map = {
     "Supraventricular Tachycardia": 2,
     "Atrial Flutter": 3,
     "Other Tachy": 4,
-    "Not Tachycardia": -1
+    "Tachycardia": -1
 }
 
 @st.cache_resource

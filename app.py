@@ -1,6 +1,6 @@
 # app.py
 """
-Streamlit app for ECG Arrhythmia Detection — hybrid rule-based + RandomForest
+Streamlit app for BeatSense: Python-Based Arrhythmia Detection Through Signal Processing
 Run locally with:
     pip install -r requirements.txt
     streamlit run app.py
@@ -21,8 +21,8 @@ import matplotlib.pyplot as plt
 import streamlit as st
 from datetime import datetime
 
-st.set_page_config(page_title="ECG Arrhythmia Detection", layout="wide")
-st.title("ECG Arrhythmia Detection — Hybrid Rule + ML")
+st.set_page_config(page_title="BeatSense", layout="wide")
+st.title("BeatSense: Python-Based Arrhythmia Detection Through Signal Processing")
 st.markdown("Upload `.hea` and `.dat` (and `.atr` if available). The app will extract beats, train a RF beat classifier, apply sequence-level rules, and optionally train an RF for tachy subtypes.")
 
 WORK_DIR = "ecg_data"

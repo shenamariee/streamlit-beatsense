@@ -1,7 +1,9 @@
-streamlit
-wfdb
+setuptools>=65.0.0
+distutils
 numpy>=1.25.0
+wfdb>=5.0.3
 pandas>=2.0.3
 scipy==1.10.0
 scikit-learn==1.2.2
 matplotlib==3.7.1
+streamlit

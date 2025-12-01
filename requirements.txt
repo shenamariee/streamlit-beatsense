@@ -1,0 +1,7 @@
+streamlit
+wfdb==4.1.0
+numpy
+pandas==1.5.3
+scipy
+scikit-learn
+matplotlib

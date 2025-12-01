@@ -233,7 +233,7 @@ if run_button:
         avg_hr = 60 / np.mean(seq_rr) if np.mean(seq_rr) > 0 else 0
         if avg_hr < 60:
             seq_labels.append(0)
-            tachy_results.append("Not Tachycardia")
+            tachy_results.append("Tachycardia")
         elif avg_hr > 100:
             seq_labels.append(2)
             seq_beats = labels[i:i+seq_len]
@@ -244,7 +244,7 @@ if run_button:
             tachy_results.append(subtype)
         else:
             seq_labels.append(1)
-            tachy_results.append("Not Tachycardia")
+            tachy_results.append("Tachycardia")
 
     seq_features = []
     seq_target = []

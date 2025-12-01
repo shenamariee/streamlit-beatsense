@@ -5,6 +5,9 @@ Run locally with:
     pip install -r requirements.txt
     streamlit run app.py
 """
+import sys
+print(f"Python version: {sys.version}")
+
 import os
 import io
 import numpy as np

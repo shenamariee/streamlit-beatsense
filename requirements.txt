@@ -1,8 +1,7 @@
-setuptools>=68.0.0
-numpy>=1.25.0
-wfdb>=5.0.3
-pandas>=2.0.3
-scipy>=1.10.0
-scikit-learn>=1.2.2
-matplotlib>=3.7.1
 streamlit
+wfdb==4.3.0
+numpy>=1.24.0,<1.26.0
+pandas==1.5.3
+scipy==1.10.0
+scikit-learn==1.2.2
+matplotlib==3.7.1

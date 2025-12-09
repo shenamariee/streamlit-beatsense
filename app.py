@@ -9,18 +9,22 @@ import sys
 print(f"Python version: {sys.version}")
 
 import os
+import io
 import numpy as np
 import pandas as pd
 import wfdb
+from wfdb.processing import gqrs_detect
 from scipy.signal import butter, filtfilt, resample
-import streamlit as st
-import matplotlib.pyplot as plt
-import torch
-import torch.nn as nn
 from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import classification_report, confusion_matrix
+import matplotlib.pyplot as plt
+import streamlit as st
+from datetime import datetime
 
 st.set_page_config(page_title="BeatSense", layout="wide")
 st.title("BeatSense: Python-Based Arrhythmia Detection Through Signal Processing")
+st.markdown("Upload `.hea` and `.dat` (and `.atr` if available). The app will extract beats, train a RF beat classifier, apply sequence-level rules, and optionally train an RF for tachy subtypes.")
 
 WORK_DIR = "ecg_data"
 os.makedirs(WORK_DIR, exist_ok=True)
@@ -45,26 +49,6 @@ def bandpass(sig, fs, low=0.5, high=40):
     b, a = butter(3, [low / (fs / 2), high / (fs / 2)], btype="band")
     return filtfilt(b, a, sig)
 
-def pan_tompkins_detector(signal, fs):
-    b, a = butter(3, [5/(fs/2), 15/(fs/2)], btype='band')
-    filtered_ecg = filtfilt(b, a, signal)
-    diff_signal = np.ediff1d(filtered_ecg, to_end=0)
-    squared = diff_signal ** 2
-    window_size = int(0.150 * fs)
-    integrated = np.convolve(squared, np.ones(window_size)/window_size, mode='same')
-    from scipy.signal import find_peaks
-    distance = int(0.25 * fs)
-    height = np.mean(integrated) * 1.2
-    peaks, _ = find_peaks(integrated, distance=distance, height=height)
-    refined_peaks = []
-    search_radius = int(0.05 * fs)
-    for p in peaks:
-        start = max(p - search_radius, 0)
-        end = min(p + search_radius, len(signal))
-        local_max = np.argmax(signal[start:end]) + start
-        refined_peaks.append(local_max)
-    return np.unique(refined_peaks)
-
 def extract_beats(signal, r_peaks, fs, window_ms=700, resample_len=100):
     half = int((window_ms / 1000) * fs // 2)
     beats = []
@@ -76,6 +60,24 @@ def extract_beats(signal, r_peaks, fs, window_ms=700, resample_len=100):
         beats.append(resample(beat, resample_len))
         indices.append(r)
     return np.array(beats), np.array(indices)
+
+def extract_features(beats, rr_intervals):
+    features = []
+    for i, beat in enumerate(beats):
+        rr = rr_intervals[i] if i < len(rr_intervals) else rr_intervals[-1]
+        features.append([
+            np.mean(beat),
+            np.std(beat),
+            np.min(beat),
+            np.max(beat),
+            rr,
+            np.median(beat),
+            np.percentile(beat, 25),
+            np.percentile(beat, 75),
+            np.sum(beat**2),
+            len(beat)
+        ])
+    return np.array(features)
 
 def is_irregular(rr_segment, threshold=0.12):
     return np.std(rr_segment) > threshold
@@ -106,47 +108,18 @@ tachy_label_map = {
     "Tachycardia": -1
 }
 
-# CNN model
-class ECGBeatCNN(nn.Module):
-    def __init__(self, num_classes=6):
-        super(ECGBeatCNN, self).__init__()
-        self.conv1 = nn.Conv1d(1, 32, kernel_size=5, padding=2)
-        self.bn1 = nn.BatchNorm1d(32)
-        self.pool = nn.MaxPool1d(2)
-        self.conv2 = nn.Conv1d(32, 64, kernel_size=5, padding=2)
-        self.bn2 = nn.BatchNorm1d(64)
-        self.fc1 = nn.Linear(64 * (resample_len // 2), 128)
-        self.dropout = nn.Dropout(0.3)
-        self.fc2 = nn.Linear(128, num_classes)
-
-    def forward(self, x):
-        x = self.pool(torch.relu(self.bn1(self.conv1(x))))
-        x = torch.relu(self.bn2(self.conv2(x)))
-        x = x.view(x.size(0), -1)
-        x = self.dropout(torch.relu(self.fc1(x)))
-        x = self.fc2(x)
-        return x
-
 @st.cache_resource
-def load_cnn_model(model_path=None, num_classes=6):
-    model = ECGBeatCNN(num_classes=num_classes)
-    if model_path is not None and os.path.exists(model_path):
-        model.load_state_dict(torch.load(model_path, map_location=torch.device('cpu')))
-    model.eval()
-    return model
+def train_rf_model(X, y, n_estimators=200):
+    clf = RandomForestClassifier(n_estimators=n_estimators, class_weight='balanced', random_state=42)
+    clf.fit(X, y)
+    return clf
 
-def predict_beats_cnn(model, beat_segments):
-    inputs = torch.tensor(beat_segments, dtype=torch.float32).unsqueeze(1)
-    with torch.no_grad():
-        outputs = model(inputs)
-        preds = torch.argmax(outputs, dim=1).numpy()
-    return preds
-
-# UI and main pipeline
 st.sidebar.header("Upload ECG files")
 uploaded_files = st.sidebar.file_uploader("Upload .hea, .dat, .atr files (same basename)", type=["hea","dat","atr"], accept_multiple_files=True)
 if uploaded_files:
-    save_uploaded_files(uploaded_files, dest_dir=WORK_DIR)
+    saved = save_uploaded_files(uploaded_files, dest_dir=WORK_DIR)
+    st.sidebar.success(f"Saved {len(saved)} files to {WORK_DIR}")
+
 available_bases = get_base_names(WORK_DIR)
 if not available_bases:
     st.info("No files available — upload .hea/.dat/.atr in the sidebar.")
@@ -179,7 +152,7 @@ if run_button:
     ch_idx = channels.index(chosen_channel)
     signal = record.p_signal[:, ch_idx]
     fs = record.fs
-    st.write(f"Sampling frequency: {fs} Hz")
+    st.write(f"fs: {fs} Hz")
     max_samples = int(max_duration_sec * fs)
     signal = signal[:max_samples]
 
@@ -188,8 +161,8 @@ if run_button:
         labels = np.array(ann.symbol) if hasattr(ann, "symbol") else np.array(["N"] * len(r_peaks))
         st.success(f"Annotation found: {len(r_peaks)} annotations.")
     else:
-        st.warning("No annotation — running Pan-Tompkins.")
-        r_peaks = pan_tompkins_detector(signal, fs)
+        st.warning("No annotation — running GQRS detector.")
+        r_peaks = gqrs_detect(sig=signal, fs=fs)
         labels = np.array(["N"] * len(r_peaks))
 
     valid_idx = np.where(r_peaks < max_samples)[0]
@@ -203,31 +176,49 @@ if run_button:
         st.stop()
 
     rr = np.diff(r_peaks) / fs
-    rr = np.append(rr, rr[-1]) if len(rr)>0 else np.array([1.0])
-    y_beats = np.array([label_map.get(l, 0) for l in labels[:len(beats)]])
+    rr = np.append(rr, rr[-1]) if len(rr) > 0 else np.array([1.0])
 
-    model_path = os.path.join(WORK_DIR, "cnn_beat_classifier.pth")
-    cnn_model = load_cnn_model(model_path=model_path, num_classes=len(label_map))
+    # Smooth RR intervals with rolling median and clip physiologic range
+    rr_series = pd.Series(rr)
+    rr_smooth = rr_series.rolling(window=3, center=True, min_periods=1).median()
+    rr_smooth = rr_smooth.fillna(method='bfill').fillna(method='ffill').to_numpy()
+    rr_smooth = np.clip(rr_smooth, 0.3, 2.0)
 
-    beats_norm = (beats - np.mean(beats, axis=1, keepdims=True)) / (np.std(beats, axis=1, keepdims=True) + 1e-6)
+    beat_features = extract_features(beats, rr_smooth)
+    y_beats = np.array([label_map.get(l, 0) for l in labels[:len(beat_features)]])
 
-    if len(beats_norm) < 5 or len(np.unique(y_beats)) < 2:
+    if len(beat_features) < 5 or len(np.unique(y_beats)) < 2:
         st.warning("Insufficient beat samples/labels for ML. Showing available outputs.")
-        cnn_preds = np.zeros(len(beats_norm), dtype=int)
+        clf_beats = None
+        pred_beats = np.array([0]*len(y_beats))
     else:
-        cnn_preds = predict_beats_cnn(cnn_model, beats_norm)
+        X_train, X_test, y_train, y_test = train_test_split(
+            beat_features, y_beats, test_size=0.2, random_state=42,
+            stratify=y_beats if len(np.unique(y_beats)) > 1 else None
+        )
+        clf_beats = train_rf_model(X_train, y_train)
+        pred_beats = clf_beats.predict(X_test)
+        st.subheader("Beat-level classification")
+        st.text(classification_report(y_test, pred_beats, zero_division=0))
+        st.write("Confusion matrix (beat-level):")
+        st.dataframe(pd.DataFrame(confusion_matrix(y_test, pred_beats), index=np.unique(y_test), columns=np.unique(y_test)))
 
-    inv_label_map = {v:k for k,v in label_map.items()}
-    beat_predictions = [inv_label_map.get(p, "N/A") for p in cnn_preds]
+    beat_hr_labels = []
+    for rr_val in rr_smooth[:len(beat_features)]:
+        hr = 60 / rr_val if rr_val > 0 else 0
+        if hr < 60:
+            beat_hr_labels.append('Bradycardia')
+        elif hr > 100:
+            beat_hr_labels.append('Tachycardia')
+        else:
+            beat_hr_labels.append('Normal')
 
-    # Sequence window params
     seq_len = 25
     seq_step = 5
     seq_labels = []
     tachy_results = []
-
-    for i in range(0, max(1, len(rr) - seq_len), seq_step):
-        seq_rr = rr[i:i+seq_len]
+    for i in range(0, max(1, len(rr_smooth) - seq_len), seq_step):
+        seq_rr = rr_smooth[i:i+seq_len]
         if len(seq_rr) == 0:
             continue
         avg_hr = 60 / np.mean(seq_rr) if np.mean(seq_rr) > 0 else 0
@@ -236,7 +227,7 @@ if run_button:
             tachy_results.append("Bradycardia")
         elif avg_hr > 100:
             seq_labels.append(2)
-            seq_beats = beat_predictions[i:i+seq_len]
+            seq_beats = labels[i:i+seq_len]
             if is_irregular(seq_rr):
                 subtype = classify_tachycardia_irregular(seq_beats)
             else:
@@ -251,8 +242,8 @@ if run_button:
     seq_index_map = []
     for idx in range(len(seq_labels)):
         start = idx * seq_step
-        seq_rr = rr[start : start + seq_len]
-        seq_beats = beat_predictions[start : start + seq_len]
+        seq_rr = rr_smooth[start : start + seq_len]
+        seq_beats = labels[start : start + seq_len]
         if len(seq_rr) < 2:
             continue
         mean_rr = np.mean(seq_rr)
@@ -288,41 +279,61 @@ if run_button:
     seq_target = np.array(seq_target)
     seq_index_map = np.array(seq_index_map)
 
-    if len(seq_features) < 5 or len(np.unique(seq_target)) < 2:
-        st.warning("Insufficient sequence samples for RF classifier. Displaying sequence-level rule results only.")
-        seq_pred_labels = seq_target
-    else:
-        rf_clf = RandomForestClassifier(n_estimators=150, random_state=42)
-        rf_clf.fit(seq_features, seq_target)
-        seq_pred_labels = rf_clf.predict(seq_features)
+    train_mask = seq_target != -1
+    X_tachy = seq_features[train_mask]
+    y_tachy = seq_target[train_mask]
 
-    # Overall summary
+    use_ml2 = False
+    clf_tachy = None
+    if len(y_tachy) >= 5 and len(np.unique(y_tachy)) > 1:
+        X_tr, X_val, y_tr, y_val = train_test_split(
+            X_tachy, y_tachy, test_size=0.2, random_state=42,
+            stratify=y_tachy if len(np.unique(y_tachy)) > 1 else None
+        )
+        clf_tachy = train_rf_model(X_tr, y_tr)
+        use_ml2 = True
+        y_pred_val = clf_tachy.predict(X_val)
+        st.subheader("Tachycardia subtype classifier (RF #2) validation")
+        st.text(classification_report(y_val, y_pred_val, zero_division=0))
+        st.write("Confusion matrix (RF #2 validation):")
+        st.dataframe(pd.DataFrame(confusion_matrix(y_val, y_pred_val)))
+    else:
+        st.info("Not enough tachy sequences to train RF #2. Using rule-based subtypes.")
+
+    if use_ml2:
+        inv_tachy_map = {v:k for k,v in tachy_label_map.items() if v != -1}
+        for row_idx, seq_idx in enumerate(seq_index_map):
+            if seq_target[row_idx] != -1:
+                pred_int = clf_tachy.predict([seq_features[row_idx]])[0]
+                pred_str = inv_tachy_map.get(pred_int, "Other Tachy")
+                if seq_labels[seq_idx] == 2:
+                    tachy_results[seq_idx] = pred_str
+
     overall_summary = {"Bradycardia":0, "Normal":0, "Tachycardia":0, "AFib":0, "VT":0, "SVT":0, "AFlutter":0, "Other Tachy":0}
-    for i, label in enumerate(seq_pred_labels):
+    for i, label in enumerate(seq_labels):
         if label == 0:
             overall_summary["Bradycardia"] += 1
         elif label == 1:
             overall_summary["Normal"] += 1
         else:
             overall_summary["Tachycardia"] += 1
-            orig_label = list(tachy_label_map.keys())[list(tachy_label_map.values()).index(label)]
-            if orig_label == "Atrial Fibrillation":
+            subtype = tachy_results[i]
+            if subtype == "Atrial Fibrillation":
                 overall_summary["AFib"] += 1
-            elif orig_label == "Ventricular Tachycardia":
+            elif subtype == "Ventricular Tachycardia":
                 overall_summary["VT"] += 1
-            elif orig_label == "Supraventricular Tachycardia":
+            elif subtype == "Supraventricular Tachycardia":
                 overall_summary["SVT"] += 1
-            elif orig_label == "Atrial Flutter":
+            elif subtype == "Atrial Flutter":
                 overall_summary["AFlutter"] += 1
             else:
                 overall_summary["Other Tachy"] += 1
 
     st.subheader("Overall rhythm summary (sequence-level windows)")
     total_sequences = sum(overall_summary.values()) if sum(overall_summary.values())>0 else 1
-    summary_table = pd.DataFrame([{"Rhythm Type": k, "Sequences": v, "Percent": (v/total_sequences)*100} for k,v in overall_summary.items() if v>0])
+    summary_table = pd.DataFrame([{"Rhythm Type": k, "Sequences": v, "Percent": (v/total_sequences)*100 if total_sequences>0 else 0.0} for k,v in overall_summary.items() if v>0])
     st.dataframe(summary_table)
 
-    # Plot ECG + R peaks
     fig, ax = plt.subplots(figsize=(12,3))
     ax.plot(signal, label='ECG Signal')
     ax.scatter(r_peaks, signal[r_peaks], color='red', s=10, label='R-peaks')
@@ -333,11 +344,36 @@ if run_button:
     st.subheader("ECG plot with detected/annotated R-peaks")
     st.pyplot(fig)
 
-    st.subheader("First 20 beats (CNN beat label)")
-    beat_table = pd.DataFrame({
-        "Beat Index": np.arange(min(20, len(beat_predictions))),
-        "Predicted Beat Label": beat_predictions[:20],
-        "Original Label": labels[:20],
-        "RR Interval (s)": rr[:20]
-    })
-    st.dataframe(beat_table)
+    st.subheader("First 20 beats (ML beat label if available, HR, Sequence-level rhythm)")
+    beat_rows = []
+    for i in range(min(20, len(beat_features))):
+        ml_label = "N/A"
+        if clf_beats is not None:
+            try:
+                ml_pred = clf_beats.predict([beat_features[i]])[0]
+                ml_label = [k for k,v in label_map.items() if v==ml_pred][0]
+            except Exception:
+                ml_label = "N/A"
+        hr = 60 / rr_smooth[i] if rr_smooth[i] > 0 else 0
+        seq_idx = min(i, max(0, len(seq_labels)-1))
+        if hr < 60:
+            beat_rhythm_label = "Bradycardia"
+        elif hr > 100:
+            beat_rhythm_label = tachy_results[seq_idx] if seq_idx < len(tachy_results) else "Tachycardia"
+        else:
+            beat_rhythm_label = "Normal"
+        beat_rows.append({"Beat": i, "ML_Label": ml_label, "HR_bpm": round(hr,1), "Rhythm": beat_rhythm_label})
+    st.table(pd.DataFrame(beat_rows))
+
+    beat_df = pd.DataFrame(beat_features, columns=["mean","std","min","max","rr","median","p25","p75","energy","length"])
+    beat_df["annotation_symbol"] = labels[:len(beat_features)]
+    beat_df["rr_smooth"] = rr_smooth[:len(beat_features)]
+    beat_df["hr_bpm"] = 60 / beat_df["rr_smooth"].replace(0, np.nan)
+    st.subheader("Beat features preview")
+    st.dataframe(beat_df.head(10))
+
+    st.success("Analysis complete!")
+
+else:
+    st.info("Upload ECG files and press 'Run ECG Analysis'")
+

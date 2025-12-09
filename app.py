@@ -88,8 +88,9 @@ class CNNBeatClassifier(nn.Module):
         x = self.fc2(x)
         return x
 
+# UPDATED: LSTM for rhythm classification with 7 output classes for tachycardia subtypes
 class LSTMRhythmClassifier(nn.Module):
-    def __init__(self, input_size=5, hidden_size=64, n_layers=2, n_classes=4):
+    def __init__(self, input_size=5, hidden_size=64, n_layers=2, n_classes=7):
         super().__init__()
         self.lstm = nn.LSTM(input_size, hidden_size, n_layers, batch_first=True, bidirectional=True)
         self.fc = nn.Linear(hidden_size * 2, n_classes)
@@ -102,10 +103,22 @@ class LSTMRhythmClassifier(nn.Module):
         return out
 
 # ------------------- Label mappings -------------------
-beat_label_map = {0:"N",1:"L",2:"R",3:"V",4:"A"}  # Example classes
-rhythm_label_map = {0:"Normal",1:"Atrial Fibrillation",2:"Ventricular Tachycardia",3:"Other"}
+
+beat_label_map = {0:"N",1:"L",2:"R",3:"V",4:"A"}  # Example beat classes
+
+# Expanded rhythm classes including tachycardia subtypes
+rhythm_label_map = {
+    0: "Normal",
+    1: "Atrial Fibrillation",
+    2: "Atrial Flutter",
+    3: "Supraventricular Tachycardia",
+    4: "Ventricular Tachycardia",
+    5: "Ventricular Fibrillation",
+    6: "Other"
+}
 
 # ------------------- Load or init models -------------------
+
 @st.cache_resource
 def load_models():
     cnn = CNNBeatClassifier(n_classes=len(beat_label_map)).to(DEVICE)
@@ -116,6 +129,55 @@ def load_models():
     return cnn, lstm
 
 cnn_model, lstm_model = load_models()
+
+# ------------------- Rule-based tachycardia subtype detection -------------------
+
+def detect_tachycardia_subtype(beat_labels, valid_rpeaks, fs):
+    rr_intervals = np.diff(valid_rpeaks) / fs
+    heart_rates = 60 / rr_intervals  # bpm
+    avg_hr = np.mean(heart_rates) if len(heart_rates) > 0 else 0
+
+    def consecutive_count(labels, target, min_count):
+        count = 0
+        for lbl in labels:
+            if lbl == target:
+                count += 1
+                if count >= min_count:
+                    return True
+            else:
+                count = 0
+        return False
+
+    count_total = len(beat_labels)
+    count_v = beat_labels.count('V')
+    count_a = beat_labels.count('A')
+    count_n = beat_labels.count('N')
+
+    percent_v = count_v / count_total if count_total > 0 else 0
+    percent_a = count_a / count_total if count_total > 0 else 0
+    percent_n = count_n / count_total if count_total > 0 else 0
+
+    # Rules:
+
+    if percent_v > 0.5 and avg_hr > 150:
+        return "Ventricular Fibrillation"
+
+    if consecutive_count(beat_labels, 'V', 3) and avg_hr > 100:
+        return "Ventricular Tachycardia"
+
+    if avg_hr > 150 and (percent_n + percent_a) > 0.8:
+        return "Supraventricular Tachycardia"
+
+    if percent_a > 0.3 and np.std(rr_intervals) > 0.1:
+        return "Atrial Fibrillation"
+
+    if 100 < avg_hr <= 150 and percent_a > 0.4:
+        return "Atrial Flutter"
+
+    if avg_hr > 100 and percent_n > 0.8:
+        return "Normal (Sinus Tachycardia)"
+
+    return "Normal"
 
 # ------------------- Main app logic -------------------
 
@@ -144,7 +206,7 @@ if run_button:
         st.stop()
 
     fs = int(record.fs)
-    signal = record.p_signal[:,0]  # use first channel by default
+    signal = record.p_signal[:,0]  # first channel default
 
     # Preprocessing
     signal = baseline_wander_removal(signal, fs)
@@ -155,7 +217,6 @@ if run_button:
         r_peaks = processing.gqrs_detect(sig=signal, fs=fs)
     except Exception as e:
         st.warning(f"gqrs detection failed, fallback to Pan-Tompkins")
-        # fallback simple Pan-Tompkins detector here if needed
         from scipy.signal import find_peaks
         r_peaks, _ = find_peaks(signal, distance=fs*0.25, height=np.mean(signal))
 
@@ -186,7 +247,7 @@ if run_button:
     st.subheader("Beat-level classification")
     st.dataframe(df_beats)
 
-    # Prepare sequence input for rhythm classification (using one-hot encoded beat labels)
+    # Prepare sequence input for rhythm classification (one-hot encoded beat labels)
     seq_len = 25
     step = 5
     seq_features = []
@@ -211,16 +272,21 @@ if run_button:
         seq_probs = torch.softmax(seq_outputs, dim=1)
         seq_preds = torch.argmax(seq_probs, dim=1).cpu().numpy()
 
-    rhythm_labels = [rhythm_label_map.get(p, "Other") for p in seq_preds]
+    lstm_rhythm_labels = [rhythm_label_map.get(p, "Other") for p in seq_preds]
 
-    # Display sequence-level rhythm classification
+    # Display sequence-level rhythm classification (LSTM)
     df_seq = pd.DataFrame({
         "Sequence Start Beat": seq_indices,
         "Sequence End Beat": [i+seq_len for i in seq_indices],
-        "Rhythm Classification": rhythm_labels,
+        "LSTM Rhythm Classification": lstm_rhythm_labels,
     })
-    st.subheader("Sequence-level rhythm classification")
+    st.subheader("Sequence-level rhythm classification (LSTM)")
     st.dataframe(df_seq)
+
+    # Rule-based tachycardia subtype detection
+    rule_rhythm_label = detect_tachycardia_subtype(beat_labels, valid_rpeaks, fs)
+    st.subheader("Rule-based Tachycardia subtype detection")
+    st.write(f"Detected rhythm subtype: **{rule_rhythm_label}**")
 
     # Plot ECG with R-peaks highlighted
     fig, ax = plt.subplots(figsize=(14,4))
@@ -241,4 +307,3 @@ if run_button:
 
 else:
     st.info("Upload ECG record files (.hea + .dat) and click 'Run Analysis'.")
-

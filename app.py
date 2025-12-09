@@ -13,7 +13,6 @@ import io
 import numpy as np
 import pandas as pd
 import wfdb
-from wfdb.processing import gqrs_detect
 from scipy.signal import butter, filtfilt, resample
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import train_test_split
@@ -21,6 +20,7 @@ from sklearn.metrics import classification_report, confusion_matrix
 import matplotlib.pyplot as plt
 import streamlit as st
 from datetime import datetime
+from collections import Counter
 
 st.set_page_config(page_title="BeatSense", layout="wide")
 st.title("BeatSense: Python-Based Arrhythmia Detection Through Signal Processing")
@@ -48,6 +48,26 @@ def get_base_names(directory):
 def bandpass(sig, fs, low=0.5, high=40):
     b, a = butter(3, [low / (fs / 2), high / (fs / 2)], btype="band")
     return filtfilt(b, a, sig)
+
+def pan_tompkins_detector(signal, fs):
+    b, a = butter(3, [5/(fs/2), 15/(fs/2)], btype='band')
+    filtered_ecg = filtfilt(b, a, signal)
+    diff_signal = np.ediff1d(filtered_ecg, to_end=0)
+    squared = diff_signal ** 2
+    window_size = int(0.150 * fs)
+    integrated = np.convolve(squared, np.ones(window_size)/window_size, mode='same')
+    from scipy.signal import find_peaks
+    distance = int(0.25 * fs)
+    height = np.mean(integrated) * 1.2
+    peaks, _ = find_peaks(integrated, distance=distance, height=height)
+    refined_peaks = []
+    search_radius = int(0.05 * fs)
+    for p in peaks:
+        start = max(p - search_radius, 0)
+        end = min(p + search_radius, len(signal))
+        local_max = np.argmax(signal[start:end]) + start
+        refined_peaks.append(local_max)
+    return np.unique(refined_peaks)
 
 def extract_beats(signal, r_peaks, fs, window_ms=700, resample_len=100):
     half = int((window_ms / 1000) * fs // 2)
@@ -114,6 +134,12 @@ def train_rf_model(X, y, n_estimators=200):
     clf.fit(X, y)
     return clf
 
+# Helper function for safe train_test_split with stratify
+def safe_train_test_split(X, y, test_size=0.2, random_state=42):
+    class_counts = Counter(y)
+    stratify = y if all(count >= 2 for count in class_counts.values()) else None
+    return train_test_split(X, y, test_size=test_size, random_state=random_state, stratify=stratify)
+
 st.sidebar.header("Upload ECG files")
 uploaded_files = st.sidebar.file_uploader("Upload .hea, .dat, .atr files (same basename)", type=["hea","dat","atr"], accept_multiple_files=True)
 if uploaded_files:
@@ -152,7 +178,7 @@ if run_button:
     ch_idx = channels.index(chosen_channel)
     signal = record.p_signal[:, ch_idx]
     fs = record.fs
-    st.write(f"fs: {fs} Hz")
+    st.write(f"Sampling frequency (fs): {fs} Hz")
     max_samples = int(max_duration_sec * fs)
     signal = signal[:max_samples]
 
@@ -161,8 +187,8 @@ if run_button:
         labels = np.array(ann.symbol) if hasattr(ann, "symbol") else np.array(["N"] * len(r_peaks))
         st.success(f"Annotation found: {len(r_peaks)} annotations.")
     else:
-        st.warning("No annotation — running GQRS detector.")
-        r_peaks = gqrs_detect(sig=signal, fs=fs)
+        st.warning("No annotation — running Pan-Tompkins.")
+        r_peaks = pan_tompkins_detector(signal, fs)
         labels = np.array(["N"] * len(r_peaks))
 
     valid_idx = np.where(r_peaks < max_samples)[0]
@@ -176,15 +202,8 @@ if run_button:
         st.stop()
 
     rr = np.diff(r_peaks) / fs
-    rr = np.append(rr, rr[-1]) if len(rr) > 0 else np.array([1.0])
-
-    # Smooth RR intervals with rolling median and clip physiologic range
-    rr_series = pd.Series(rr)
-    rr_smooth = rr_series.rolling(window=3, center=True, min_periods=1).median()
-    rr_smooth = rr_smooth.fillna(method='bfill').fillna(method='ffill').to_numpy()
-    rr_smooth = np.clip(rr_smooth, 0.3, 2.0)
-
-    beat_features = extract_features(beats, rr_smooth)
+    rr = np.append(rr, rr[-1]) if len(rr)>0 else np.array([1.0])
+    beat_features = extract_features(beats, rr)
     y_beats = np.array([label_map.get(l, 0) for l in labels[:len(beat_features)]])
 
     if len(beat_features) < 5 or len(np.unique(y_beats)) < 2:
@@ -192,10 +211,7 @@ if run_button:
         clf_beats = None
         pred_beats = np.array([0]*len(y_beats))
     else:
-        X_train, X_test, y_train, y_test = train_test_split(
-            beat_features, y_beats, test_size=0.2, random_state=42,
-            stratify=y_beats if len(np.unique(y_beats)) > 1 else None
-        )
+        X_train, X_test, y_train, y_test = safe_train_test_split(beat_features, y_beats)
         clf_beats = train_rf_model(X_train, y_train)
         pred_beats = clf_beats.predict(X_test)
         st.subheader("Beat-level classification")
@@ -204,7 +220,7 @@ if run_button:
         st.dataframe(pd.DataFrame(confusion_matrix(y_test, pred_beats), index=np.unique(y_test), columns=np.unique(y_test)))
 
     beat_hr_labels = []
-    for rr_val in rr_smooth[:len(beat_features)]:
+    for rr_val in rr[:len(beat_features)]:
         hr = 60 / rr_val if rr_val > 0 else 0
         if hr < 60:
             beat_hr_labels.append('Bradycardia')
@@ -217,8 +233,8 @@ if run_button:
     seq_step = 5
     seq_labels = []
     tachy_results = []
-    for i in range(0, max(1, len(rr_smooth) - seq_len), seq_step):
-        seq_rr = rr_smooth[i:i+seq_len]
+    for i in range(0, max(1, len(rr) - seq_len), seq_step):
+        seq_rr = rr[i:i+seq_len]
         if len(seq_rr) == 0:
             continue
         avg_hr = 60 / np.mean(seq_rr) if np.mean(seq_rr) > 0 else 0
@@ -242,7 +258,7 @@ if run_button:
     seq_index_map = []
     for idx in range(len(seq_labels)):
         start = idx * seq_step
-        seq_rr = rr_smooth[start : start + seq_len]
+        seq_rr = rr[start : start + seq_len]
         seq_beats = labels[start : start + seq_len]
         if len(seq_rr) < 2:
             continue
@@ -286,10 +302,7 @@ if run_button:
     use_ml2 = False
     clf_tachy = None
     if len(y_tachy) >= 5 and len(np.unique(y_tachy)) > 1:
-        X_tr, X_val, y_tr, y_val = train_test_split(
-            X_tachy, y_tachy, test_size=0.2, random_state=42,
-            stratify=y_tachy if len(np.unique(y_tachy)) > 1 else None
-        )
+        X_tr, X_val, y_tr, y_val = safe_train_test_split(X_tachy, y_tachy, test_size=0.2, random_state=42)
         clf_tachy = train_rf_model(X_tr, y_tr)
         use_ml2 = True
         y_pred_val = clf_tachy.predict(X_val)
@@ -354,7 +367,7 @@ if run_button:
                 ml_label = [k for k,v in label_map.items() if v==ml_pred][0]
             except Exception:
                 ml_label = "N/A"
-        hr = 60 / rr_smooth[i] if rr_smooth[i] > 0 else 0
+        hr = 60 / rr[i] if rr[i] > 0 else 0
         seq_idx = min(i, max(0, len(seq_labels)-1))
         if hr < 60:
             beat_rhythm_label = "Bradycardia"
@@ -362,18 +375,9 @@ if run_button:
             beat_rhythm_label = tachy_results[seq_idx] if seq_idx < len(tachy_results) else "Tachycardia"
         else:
             beat_rhythm_label = "Normal"
-        beat_rows.append({"Beat": i, "ML_Label": ml_label, "HR_bpm": round(hr,1), "Rhythm": beat_rhythm_label})
-    st.table(pd.DataFrame(beat_rows))
-
-    beat_df = pd.DataFrame(beat_features, columns=["mean","std","min","max","rr","median","p25","p75","energy","length"])
-    beat_df["annotation_symbol"] = labels[:len(beat_features)]
-    beat_df["rr_smooth"] = rr_smooth[:len(beat_features)]
-    beat_df["hr_bpm"] = 60 / beat_df["rr_smooth"].replace(0, np.nan)
-    st.subheader("Beat features preview")
-    st.dataframe(beat_df.head(10))
-
-    st.success("Analysis complete!")
+        beat_rows.append([i+1, ml_label, round(hr,2), beat_rhythm_label])
+    df_beats = pd.DataFrame(beat_rows, columns=["Beat #", "Beat label (ML)", "Heart Rate (bpm)", "Sequence rhythm"])
+    st.dataframe(df_beats)
 
 else:
-    st.info("Upload ECG files and press 'Run ECG Analysis'")
-
+    st.info("Upload ECG files and click 'Run ECG Analysis'.")

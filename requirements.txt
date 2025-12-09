@@ -7,3 +7,5 @@ matplotlib==3.7.1
 pandas<2.0.0
 pillow
 torch
+torchvision
+torchaudio

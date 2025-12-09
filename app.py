@@ -250,19 +250,34 @@ if run_button:
     beat_features = extract_features(beats, rr)
     y_beats = np.array([label_map.get(l, 0) for l in labels[:len(beat_features)]])
 
-    clf_beats = None
-    pred_beats = None
-    if len(beat_features) < 5 or len(np.unique(y_beats)) < 2:
-        st.warning("Insufficient beat samples/labels for ML. Showing available outputs (no beat classifier trained).")
-        pred_beats = np.array([0]*len(y_beats))
+   # --- Safe Train/Test Split (Handles Too-Small Classes) ---
+    from sklearn.model_selection import train_test_split
+    import numpy as np
+
+    # Convert to numpy arrays (sklearn requirement)
+    X = np.array(beat_features)
+    y = np.array(y_beats)
+    
+    # Check class distribution
+    unique, counts = np.unique(y, return_counts=True)
+    
+    # Enable stratify only if all labels appear at least twice
+    if (counts < 2).any():
+        strat = None
+        print("[INFO] Stratify disabled: some classes have fewer than 2 samples.")
     else:
-        X_train, X_test, y_train, y_test = train_test_split(beat_features, y_beats, test_size=0.2, random_state=42, stratify=y_beats)
-        clf_beats = train_rf_model(X_train, y_train, n_estimators=200)
-        pred_beats = clf_beats.predict(X_test)
-        st.subheader("Beat-level classification")
-        st.text(classification_report(y_test, pred_beats, zero_division=0))
-        st.write("Confusion matrix (beat-level):")
-        st.dataframe(pd.DataFrame(confusion_matrix(y_test, pred_beats), index=np.unique(y_test), columns=np.unique(y_test)))
+        strat = y
+    
+    # Safe split
+    X_train, X_test, y_train, y_test = train_test_split(
+        X,
+        y,
+        test_size=0.2,
+        random_state=42,
+        stratify=strat
+    )
+    # --- End of Safe Train/Test Split ---
+
 
     # label each beat HR
     beat_hr_labels = []
